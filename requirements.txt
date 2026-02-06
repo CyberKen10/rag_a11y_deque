@@ -1,0 +1,1 @@
+# Sin dependencias obligatorias: se usa urllib de Python estándar para llamar a Mistral AI.
