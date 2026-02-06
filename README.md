@@ -96,6 +96,16 @@ PYTHONPATH=src python -m rag_deque.cli \
   --hf-api-key "tu_token_hf"
 ```
 
+### 3) Interfaz moderna tipo chatbot (DequeBot)
+
+Para una experiencia visual moderna, puedes lanzar la UI con Streamlit:
+
+```bash
+PYTHONPATH=src streamlit run src/rag_deque/web_ui.py
+```
+
+Incluye branding de **DequeBot**, historial conversacional, configuración de modelo y visual estilo chat.
+
 ## Estructura
 
 - `src/rag_deque/ingestion.py`: lectura de `.docx`, chunking e índice.
