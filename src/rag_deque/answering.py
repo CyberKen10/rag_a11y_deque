@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 from typing import List
@@ -16,7 +17,10 @@ from .retrieval import RetrievedChunk
 
 
 LOW_CONFIDENCE_THRESHOLD = 0.05
-HF_INFERENCE_URL_TEMPLATE = "https://api-inference.huggingface.co/models/{model}"
+HF_INFERENCE_URL_TEMPLATES = (
+    "https://router.huggingface.co/hf-inference/models/{model}",
+    "https://api-inference.huggingface.co/models/{model}",
+)
 GROK_API_URL = "https://api.x.ai/v1/chat/completions"
 TOGETHER_API_URL = "https://api.together.xyz/v1/chat/completions"
 
@@ -46,6 +50,85 @@ def _build_evidence_lines(retrieved: List[RetrievedChunk]) -> List[str]:
             f"- ({item.score:.3f}) [{item.chunk.source_file} | {item.chunk.section}] {snippet}"
         )
     return evidence_lines
+
+
+def _normalize_token(token: str) -> str:
+    return re.sub(r"[^a-z0-9áéíóúñü-]", "", token.lower())
+
+
+def _extract_query_tokens(question: str) -> set[str]:
+    tokens: set[str] = set()
+    for raw in question.split():
+        token = _normalize_token(raw)
+        if not token:
+            continue
+        if len(token) > 2:
+            tokens.add(token)
+        if "-" in token:
+            parts = [part for part in token.split("-") if len(part) > 2]
+            tokens.update(parts)
+    return tokens
+
+
+def _is_aria_live_question(question: str) -> bool:
+    q = question.lower()
+    return "aria-live" in q or "aria live" in q
+
+
+def _extract_aria_live_guidance(retrieved: List[RetrievedChunk]) -> List[str]:
+    hints: List[str] = []
+    for item in retrieved:
+        for sentence in _sentence_candidates(item.chunk.text):
+            lower = sentence.lower()
+            if "aria live" in lower or "aria-live" in lower:
+                hints.append(sentence)
+            elif "alerta" in lower and ("anunciar" in lower or "dom" in lower):
+                hints.append(sentence)
+    deduped = list(dict.fromkeys(hints))
+    return deduped[:3]
+
+
+def _sentence_candidates(text: str) -> List[str]:
+    clean_text = text.replace("\n", " ").strip()
+    if not clean_text:
+        return []
+    sentences = re.split(r"(?<=[.!?])\s+", clean_text)
+    return [s.strip() for s in sentences if s.strip()]
+
+
+def _build_local_grounded_answer(question: str, retrieved: List[RetrievedChunk]) -> str:
+    if _is_aria_live_question(question):
+        aria_live_hints = _extract_aria_live_guidance(retrieved)
+        if aria_live_hints:
+            return "\n".join(f"- {line}" for line in aria_live_hints)
+
+    query_tokens = _extract_query_tokens(question)
+    ranked_sentences: List[tuple[float, str]] = []
+
+    for item in retrieved[:5]:
+        for sentence in _sentence_candidates(item.chunk.text):
+            sentence_tokens = {
+                token
+                for raw in sentence.split()
+                if (token := _normalize_token(raw))
+            }
+            overlap = len(query_tokens & sentence_tokens)
+            has_exact_phrase = "aria-live" in sentence.lower() and "aria-live" in question.lower()
+            bonus = 3 if has_exact_phrase else 0
+            score = item.score + overlap * 0.07 + bonus
+            ranked_sentences.append((score, sentence))
+
+    ranked_sentences.sort(key=lambda x: x[0], reverse=True)
+    best = [sentence for _, sentence in ranked_sentences[:3] if sentence]
+
+    if not best:
+        top_chunk = retrieved[0].chunk
+        return (
+            f"Según el documento '{top_chunk.source_file}' (sección '{top_chunk.section}'): \n\n"
+            f"{top_chunk.text[:500]}..."
+        )
+
+    return "\n".join(f"- {line}" for line in best)
 
 
 def _extract_generated_text(body: object) -> str:
@@ -92,26 +175,40 @@ def _answer_with_huggingface(
         },
     }
 
-    req = urllib.request.Request(
-        HF_INFERENCE_URL_TEMPLATE.format(model=model),
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        },
-        method="POST",
-    )
+    base_override = os.getenv("HF_INFERENCE_BASE_URL")
+    endpoints: List[str]
+    if base_override:
+        endpoints = [base_override.rstrip("/") + f"/models/{model}"]
+    else:
+        endpoints = [template.format(model=model) for template in HF_INFERENCE_URL_TEMPLATES]
 
-    try:
-        with urllib.request.urlopen(req, timeout=90) as response:
-            body = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="ignore")
-        raise RuntimeError(f"Error HTTP de Hugging Face ({exc.code}): {detail}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"No se pudo conectar con Hugging Face: {exc.reason}") from exc
+    errors: List[str] = []
+    for endpoint in endpoints:
+        req = urllib.request.Request(
+            endpoint,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+            method="POST",
+        )
 
-    return _extract_generated_text(body)
+        try:
+            with urllib.request.urlopen(req, timeout=90) as response:
+                body = json.loads(response.read().decode("utf-8"))
+            return _extract_generated_text(body)
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="ignore")
+            errors.append(f"{endpoint} -> HTTP {exc.code}: {detail}")
+            if exc.code == 410:
+                continue
+            raise RuntimeError(f"Error HTTP de Hugging Face ({exc.code}): {detail}") from exc
+        except urllib.error.URLError as exc:
+            errors.append(f"{endpoint} -> conexión fallida: {exc.reason}")
+
+    joined_errors = " | ".join(errors) if errors else "sin detalles"
+    raise RuntimeError(f"No se pudo usar Hugging Face Router/Inference: {joined_errors}")
 
 
 def _answer_with_grok(
@@ -225,7 +322,8 @@ def build_grounded_answer(question: str, retrieved: List[RetrievedChunk], model:
 
     effective_api_key = api_key or os.getenv("HF_API_KEY") or os.getenv("HUGGINGFACE_API_KEY")
 
-    # Intentar primero con API de Hugging Face, luego Together AI, luego Grok, finalmente respuesta simple
+    # Intentar primero con API de Hugging Face y, si no está disponible, usar síntesis local.
+    answer_origin = "Hugging Face Inference API + RAG"
     try:
         if effective_api_key:
             llm_answer = _answer_with_huggingface(
@@ -237,32 +335,13 @@ def build_grounded_answer(question: str, retrieved: List[RetrievedChunk], model:
         else:
             raise RuntimeError("No API key available")
     except Exception as e:
-        print(f"Hugging Face falló ({e}), intentando con Together AI...")
-        try:
-            llm_answer = _answer_with_together(
-                question,
-                retrieved,
-            )
-        except Exception as e2:
-            print(f"Together AI también falló ({e2}), intentando con Grok...")
-            try:
-                llm_answer = _answer_with_grok(
-                    question,
-                    retrieved,
-                )
-            except Exception as e3:
-                print(f"Todas las APIs fallaron ({e3}), usando respuesta simple basada en documentos...")
-                # Usar respuesta simple basada en los documentos recuperados
-                if retrieved:
-                    # Tomar el chunk más relevante y extraer información
-                    top_chunk = retrieved[0].chunk
-                    llm_answer = f"Según el documento '{top_chunk.source_file}' (sección '{top_chunk.section}'):\n\n{top_chunk.text[:500]}..."
-                else:
-                    llm_answer = "No encontré información relevante en los documentos para responder a tu pregunta."
+        print(f"Hugging Face falló ({e}), usando síntesis local basada en documentos...")
+        llm_answer = _build_local_grounded_answer(question, retrieved)
+        answer_origin = "Síntesis local + RAG"
     evidence_lines = _build_evidence_lines(retrieved)
 
     return (
-        "Respuesta (generada con Hugging Face Inference API + RAG):\n"
+        f"Respuesta (generada con {answer_origin}):\n"
         f"{llm_answer}\n\n"
         "Trazabilidad (fuentes usadas):\n"
         + "\n".join(evidence_lines)
