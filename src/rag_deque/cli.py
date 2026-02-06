@@ -13,16 +13,16 @@ def main() -> None:
     parser.add_argument("--question", required=True, type=str)
     parser.add_argument("--top-k", default=5, type=int)
     parser.add_argument(
-        "--mistral-model",
-        default="mistral-small-latest",
+        "--hf-model",
+        default="google/flan-t5-large",
         type=str,
-        help="Modelo de Mistral AI (API externa con plan gratuito y límites).",
+        help="Modelo remoto de Hugging Face Inference API (sin instalación local).",
     )
     parser.add_argument(
-        "--mistral-api-key",
+        "--hf-api-key",
         default=None,
         type=str,
-        help="API key de Mistral AI (opcional si usas variable de entorno MISTRAL_API_KEY).",
+        help="API key de Hugging Face (opcional si usas HF_API_KEY/HUGGINGFACE_API_KEY).",
     )
     args = parser.parse_args()
 
@@ -32,8 +32,8 @@ def main() -> None:
         build_grounded_answer(
             args.question,
             retrieved,
-            model=args.mistral_model,
-            api_key=args.mistral_api_key,
+            model=args.hf_model,
+            api_key=args.hf_api_key,
         )
     )
 

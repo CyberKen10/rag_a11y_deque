@@ -1,1 +1,1 @@
-# Sin dependencias obligatorias: se usa urllib de Python estándar para llamar a Mistral AI.
+# Sin dependencias obligatorias: se usa urllib de Python estándar para llamar a Hugging Face Inference API.
