@@ -17,10 +17,7 @@ from .retrieval import RetrievedChunk
 
 
 LOW_CONFIDENCE_THRESHOLD = 0.05
-HF_INFERENCE_URL_TEMPLATES = (
-    "https://router.huggingface.co/hf-inference/models/{model}",
-    "https://api-inference.huggingface.co/models/{model}",
-)
+HF_CHAT_COMPLETIONS_URL = "https://router.huggingface.co/v1/chat/completions"
 GROK_API_URL = "https://api.x.ai/v1/chat/completions"
 TOGETHER_API_URL = "https://api.together.xyz/v1/chat/completions"
 
@@ -132,6 +129,16 @@ def _build_local_grounded_answer(question: str, retrieved: List[RetrievedChunk])
 
 
 def _extract_generated_text(body: object) -> str:
+    # Formato para router.huggingface.co (chat completions)
+    if isinstance(body, dict):
+        if "choices" in body and body["choices"]:
+            choice = body["choices"][0]
+            if "message" in choice and "content" in choice["message"]:
+                return str(choice["message"]["content"]).strip()
+        if "error" in body:
+            raise RuntimeError(f"Hugging Face devolvió error: {body['error']}")
+
+    # Formato legacy para api-inference.huggingface.co
     if isinstance(body, list) and body:
         first = body[0]
         if isinstance(first, dict) and "generated_text" in first:
@@ -140,10 +147,8 @@ def _extract_generated_text(body: object) -> str:
     if isinstance(body, dict):
         if "generated_text" in body:
             return str(body["generated_text"]).strip()
-        if "error" in body:
-            raise RuntimeError(f"Hugging Face devolvió error: {body['error']}")
 
-    raise RuntimeError("Respuesta no reconocida de Hugging Face Inference API.")
+    raise RuntimeError("Respuesta no reconocida de Hugging Face API.")
 
 
 def _answer_with_huggingface(
@@ -153,62 +158,62 @@ def _answer_with_huggingface(
     api_key: str,
 ) -> str:
     context = _build_context(retrieved)
-    prompt = (
-        "Eres un asistente de accesibilidad. Responde EXCLUSIVAMENTE con información del CONTEXTO.\n"
-        "Si la respuesta no está en el contexto, responde exactamente: 'No encontrado en la base documental'.\n"
-        "No inventes información. Responde en español, claro y breve.\n\n"
-        f"PREGUNTA:\n{question}\n\n"
-        f"CONTEXTO:\n{context}\n\n"
-        "RESPUESTA:"
-    )
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Eres un experto en accesibilidad web (WCAG, ARIA, screen readers).\n"
+                "REGLAS:\n"
+                "1. Basa tu respuesta en la información del CONTEXTO proporcionado. "
+                "Puedes sintetizar y organizar la información para que sea clara.\n"
+                "2. NO inventes datos que no estén en el contexto.\n"
+                "3. Si el contexto NO contiene NADA relevante a la pregunta, responde: "
+                "'No encontrado en la base documental'.\n"
+                "4. Menciona de qué documento viene la información cuando sea útil.\n"
+                "5. Responde en español, de forma clara y estructurada."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"PREGUNTA:\n{question}\n\n"
+                f"CONTEXTO:\n{context}\n\n"
+                "Responde basándote en el contexto anterior. Si hay información relevante, "
+                "organízala de forma clara:"
+            ),
+        },
+    ]
 
     payload = {
-        "inputs": prompt,
-        "parameters": {
-            "max_new_tokens": 220,
-            "temperature": 0.1,
-            "return_full_text": False,
-        },
-        "options": {
-            "wait_for_model": True,
-            "use_cache": False,
-        },
+        "model": model,
+        "messages": messages,
+        "max_tokens": 350,
+        "temperature": 0.1,
+        "stream": False,
     }
 
-    base_override = os.getenv("HF_INFERENCE_BASE_URL")
-    endpoints: List[str]
-    if base_override:
-        endpoints = [base_override.rstrip("/") + f"/models/{model}"]
-    else:
-        endpoints = [template.format(model=model) for template in HF_INFERENCE_URL_TEMPLATES]
+    endpoint = os.getenv("HF_INFERENCE_BASE_URL") or HF_CHAT_COMPLETIONS_URL
 
-    errors: List[str] = []
-    for endpoint in endpoints:
-        req = urllib.request.Request(
-            endpoint,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}",
-            },
-            method="POST",
-        )
+    req = urllib.request.Request(
+        endpoint,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+        method="POST",
+    )
 
-        try:
-            with urllib.request.urlopen(req, timeout=90) as response:
-                body = json.loads(response.read().decode("utf-8"))
-            return _extract_generated_text(body)
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="ignore")
-            errors.append(f"{endpoint} -> HTTP {exc.code}: {detail}")
-            if exc.code == 410:
-                continue
-            raise RuntimeError(f"Error HTTP de Hugging Face ({exc.code}): {detail}") from exc
-        except urllib.error.URLError as exc:
-            errors.append(f"{endpoint} -> conexión fallida: {exc.reason}")
-
-    joined_errors = " | ".join(errors) if errors else "sin detalles"
-    raise RuntimeError(f"No se pudo usar Hugging Face Router/Inference: {joined_errors}")
+    try:
+        with urllib.request.urlopen(req, timeout=90) as response:
+            body = json.loads(response.read().decode("utf-8"))
+        return _extract_generated_text(body)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(f"Error HTTP de Hugging Face ({exc.code}): {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"No se pudo conectar con Hugging Face: {exc.reason}") from exc
 
 
 def _answer_with_grok(

@@ -14,7 +14,7 @@ def main() -> None:
     parser.add_argument("--top-k", default=5, type=int)
     parser.add_argument(
         "--hf-model",
-        default="microsoft/DialoGPT-medium",
+        default="meta-llama/Llama-3.1-8B-Instruct",
         type=str,
         help="Modelo remoto de Hugging Face Inference API (sin instalación local).",
     )

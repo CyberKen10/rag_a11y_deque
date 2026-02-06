@@ -2,18 +2,18 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
-import re
-import zipfile
-from collections import Counter
 from pathlib import Path
-from typing import Dict, Iterable, List
+from typing import Iterable, List
 import xml.etree.ElementTree as ET
+import zipfile
 
 from .models import Chunk
 
 ALLOWED_EXTENSIONS = {".docx"}
-TOKEN_RE = re.compile(r"[a-záéíóúñ0-9]{2,}", re.IGNORECASE)
+
+# Modelo de embeddings: all-MiniLM-L6-v2 (más pequeño y rápido, solo inglés pero funciona bien)
+# Alternativas: "paraphrase-multilingual-MiniLM-L12-v2" (multilenguaje, más pesado)
+EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 
 
 def iter_docx_files(input_dir: Path) -> Iterable[Path]:
@@ -38,7 +38,8 @@ def extract_text_from_docx(path: Path) -> str:
     return "\n".join(paragraphs)
 
 
-def split_into_chunks(text: str, max_chars: int = 900) -> List[str]:
+def split_into_chunks(text: str, max_chars: int = 600, overlap_chars: int = 100) -> List[str]:
+    """Divide texto en chunks con overlap para no perder contexto en los bordes."""
     paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
     chunks: List[str] = []
     current, current_len = [], 0
@@ -46,7 +47,14 @@ def split_into_chunks(text: str, max_chars: int = 900) -> List[str]:
     for p in paragraphs:
         if current and current_len + len(p) + 1 > max_chars:
             chunks.append("\n".join(current))
-            current, current_len = [p], len(p)
+            # Overlap: mantener los últimos párrafos que quepan en overlap_chars
+            overlap, overlap_len = [], 0
+            for prev_p in reversed(current):
+                if overlap_len + len(prev_p) + 1 > overlap_chars:
+                    break
+                overlap.insert(0, prev_p)
+                overlap_len += len(prev_p) + 1
+            current, current_len = overlap + [p], overlap_len + len(p) + 1
         else:
             current.append(p)
             current_len += len(p) + 1
@@ -55,19 +63,21 @@ def split_into_chunks(text: str, max_chars: int = 900) -> List[str]:
     return chunks
 
 
-def tokenize(text: str) -> List[str]:
-    return [t.lower() for t in TOKEN_RE.findall(text)]
-
-
-def tfidf_vector(tokens: List[str], idf: Dict[str, float]) -> Dict[str, float]:
-    counts = Counter(tokens)
-    total = sum(counts.values()) or 1
-    vec = {term: (freq / total) * idf.get(term, 0.0) for term, freq in counts.items()}
-    norm = math.sqrt(sum(v * v for v in vec.values())) or 1.0
-    return {k: v / norm for k, v in vec.items()}
-
-
 def build_index(input_dir: Path, output_dir: Path) -> None:
+    """
+    Indexa documentos usando embeddings semánticos (sentence-transformers).
+    """
+    try:
+        from sentence_transformers import SentenceTransformer
+    except ImportError:
+        raise ImportError(
+            "sentence-transformers no está instalado. Ejecuta: pip install sentence-transformers"
+        )
+
+    print(f"Cargando modelo de embeddings: {EMBEDDING_MODEL_NAME}...")
+    model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+    print("Modelo cargado.")
+
     all_chunks: List[Chunk] = []
     for docx_file in iter_docx_files(input_dir):
         text = extract_text_from_docx(docx_file)
@@ -84,31 +94,42 @@ def build_index(input_dir: Path, output_dir: Path) -> None:
     if not all_chunks:
         raise ValueError("No se encontraron archivos .docx con contenido para indexar.")
 
-    tokenized_docs = [tokenize(c.text) for c in all_chunks]
-    doc_freq: Counter = Counter()
-    for tokens in tokenized_docs:
-        doc_freq.update(set(tokens))
-
-    n_docs = len(tokenized_docs)
-    idf = {term: math.log((1 + n_docs) / (1 + df)) + 1 for term, df in doc_freq.items()}
-    vectors = [tfidf_vector(tokens, idf) for tokens in tokenized_docs]
+    print(f"Generando embeddings para {len(all_chunks)} chunks...")
+    chunk_texts = [c.text for c in all_chunks]
+    embeddings = model.encode(chunk_texts, show_progress_bar=True, convert_to_numpy=True)
+    print("Embeddings generados.")
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Guardar chunks
     with (output_dir / "chunks.jsonl").open("w", encoding="utf-8") as f:
         for chunk in all_chunks:
             f.write(json.dumps(chunk.to_dict(), ensure_ascii=False) + "\n")
 
-    with (output_dir / "index.json").open("w", encoding="utf-8") as f:
-        json.dump({"idf": idf, "vectors": vectors}, f, ensure_ascii=False)
+    # Guardar embeddings (como lista de listas para JSON)
+    import numpy as np
+    with (output_dir / "embeddings.json").open("w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "model": EMBEDDING_MODEL_NAME,
+                "embeddings": embeddings.tolist(),
+                "dimension": embeddings.shape[1],
+            },
+            f,
+            ensure_ascii=False,
+        )
+
+    print(f"Índice guardado en: {output_dir}")
+    print(f"  - {len(all_chunks)} chunks")
+    print(f"  - Dimensión de embeddings: {embeddings.shape[1]}")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Indexa documentos Word (.docx) para RAG.")
+    parser = argparse.ArgumentParser(description="Indexa documentos Word (.docx) para RAG con embeddings.")
     parser.add_argument("--input-dir", required=True, type=Path, help="Carpeta con .docx")
     parser.add_argument("--output-dir", default=Path("data/index"), type=Path)
     args = parser.parse_args()
     build_index(args.input_dir, args.output_dir)
-    print(f"Índice generado en: {args.output_dir}")
 
 
 if __name__ == "__main__":
